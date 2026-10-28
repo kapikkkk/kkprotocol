@@ -1,80 +1,105 @@
 # kkprotocol
 
-**可声明、可组帧、可自愈的 TCP 流式自定义帧解析器。**
+**Declarative, self-resynchronizing frame codec for streaming custom protocols.**
 
-`kkprotocol` 面向「私有二进制协议」场景：设备通过 TCP / 串口服务器吐出一串字节，
-你只负责**声明帧长什么样**，剩下的黏包、半包、脏数据重同步、长度回填、校验计算
-都交给它。解析和组帧共用同一套字段声明，收发格式不同就写两份。
+English | [简体中文](README.zh-CN.md)
 
-- 纯 Python、零依赖，Python 3.9+
-- 三行声明就能跑：`Field` 描述帧结构 → `AbstractFrameCodec` 解析 → `Protocol` 组帧
-- 三种定界：长度前缀、分隔符（含字节转义/透明传输）、自适应
-- 设备号未知 → 自动学习 → 当成同步锚点的完整生命周期
-- 异步流式接口，直接对接 `asyncio.StreamReader`
-- 声明式组帧：长度、校验、序列号、时间戳、设备号自动回填
-- 内置 10+ 公共协议示例（DL/T645、CJ/T188、M-Bus、Modbus ASCII、BACnet MS/TP、NMEA-0183 …）
+`kkprotocol` targets *private binary protocols*: a device dumps bytes onto TCP or a
+serial-to-Ethernet converter, and all you do is **declare what a frame looks like** —
+sticky packets, half frames, garbage-prefix resync, length backfill and checksum
+computation are handled for you.
 
----
+There is **one field language** (`Field`) and **two ways to use it**:
 
-## 目录
+| Approach | Entry point | Can do | When to use |
+|---|---|---|---|
+| **A. Declarative** (recommended) | `FrameSpec` + `Protocol` | parse **and** build | the default |
+| B. Subclassing | subclass `AbstractFrameCodec`, implement `rules()` | parse only | when you need custom logic |
 
-1. [为什么用它](#1-为什么用它)
-2. [安装](#2-安装)
-3. [30 秒上手](#3-30-秒上手)
-4. [一帧怎么声明](#4-一帧怎么声明)
-5. [三种定界方式](#5-三种定界方式)
-6. [帧首是设备号（未知 → 学到 → 固定）](#6-帧首是设备号未知--学到--固定)
-7. [异步与流式](#7-异步与流式)
-8. [解析结果怎么用](#8-解析结果怎么用)
-9. [出错、自愈与统计](#9-出错自愈与统计)
-10. [声明式组帧](#10-声明式组帧)
-11. [内置协议示例](#11-内置协议示例)
-12. [常见坑](#12-常见坑)
-13. [API 速查](#13-api-速查)
-14. [测试与性能](#14-测试与性能)
-15. [License](#15-license)
+The two mix freely: `FrameSpec.to_codec()` turns an A declaration into a B-style codec.
+**Section 3** explains how to choose — read it first, or the rest will feel ambiguous.
+
+- Pure Python, zero dependencies, Python 3.9+
+- Three framing modes: length prefix, delimiter (with byte escaping), auto-detect
+- Full device-id lifecycle: unknown → learned → used as a sync anchor
+- Async streaming API, plugs straight into `asyncio.StreamReader`
+- Declarative building: length, checksum, sequence, timestamp, device id all backfilled
+- 11 real-world public protocol examples (DL/T645, CJ/T188, M-Bus, Modbus ASCII, BACnet MS/TP, NMEA 0183 …)
 
 ---
 
-## 1. 为什么用它
+## Contents
 
-处理 TCP 自定义协议时，真正烦人的从来不是「解析一帧」，而是：
+1. [Why this library](#1-why-this-library)
+2. [Install](#2-install)
+3. [Two APIs, pick one](#3-two-apis-pick-one)
+4. [Quick start](#4-quick-start)
+5. [Declaring a frame](#5-declaring-a-frame)
+6. [Three framing modes](#6-three-framing-modes)
+7. [Device id at the frame head](#7-device-id-at-the-frame-head)
+8. [Async and streaming](#8-async-and-streaming)
+9. [Working with parsed frames](#9-working-with-parsed-frames)
+10. [Errors, resync and stats](#10-errors-resync-and-stats)
+11. [Building frames in depth](#11-building-frames-in-depth)
+12. [Bundled protocols and examples](#12-bundled-protocols-and-examples)
+13. [Pitfalls](#13-pitfalls)
+14. [API cheat sheet](#14-api-cheat-sheet)
+15. [Tests and performance](#15-tests-and-performance)
+16. [License](#16-license)
 
-- **黏包 / 半包**：一次 `recv` 可能拿到半帧、一帧半、或十几帧拼在一起；
-- **脏数据重同步**：连接从帧中间接入，或线路抖动插入垃圾字节；
-- **长度字段不可信**：长度被破坏时按错误长度等待，会把后面的真帧一起吞掉；
-- **校验**：CRC16 / 累加和 / 异或 / LRC，各家不一样；
-- **组帧**：长度要回填、校验要覆盖一段、序列号要自增、设备号要填。
+---
 
-`kkprotocol` 把这些收进一个**声明式**模型：你只写一份字段表，解析和组帧都从它派生。
+## 1. Why this library
+
+The hard part of a TCP custom protocol is never "parse one frame". It is:
+
+- **Sticky / partial packets** — one `recv` may give you half a frame, one and a half,
+  or a dozen frames glued together;
+- **Resync after garbage** — the connection joins mid-frame, or line noise injects bytes;
+- **Untrustworthy length fields** — a corrupted length makes you wait forever and
+  swallow the real frames behind it;
+- **Checksums** — CRC16 / sum / XOR / LRC, and every vendor picks differently;
+- **Building** — length must be backfilled, checksums cover a range, sequence numbers
+  increment, device ids get filled in.
+
+`kkprotocol` folds all of that into a **declarative** model: you write one field table,
+and both parsing and building derive from it.
 
 ```python
-class MyCodec(AbstractFrameCodec):
-    def rules(self):
-        return [
-            Field.u8("header", fixed=0x55),
-            Field.u8("len"),
-            Field.raw("dev_id", 4),
-            Field.raw("data", "{len.val}-7"),
-            Field.checksum("crc", 2, group="{len}{dev_id}{data}"),
-        ]
-    def crc_imp(self, data):
-        return crc16_modbus(data)
+from kkprotocol import ChecksumRule, Field, FrameSpec, LengthRule, Protocol, crc16_modbus
 
-codec = MyCodec()                    # 一个连接一个实例
-for frame in codec.feed(chunk):      # chunk 可以是任意切分的字节
-    print(frame.value("dev_id"), frame.value("data"))
+# Declare once: what does a frame look like?
+AURORA = FrameSpec(
+    fields=[
+        Field.u8("header", fixed=0xAA),
+        Field.u8("len"),
+        Field.u8("cmd"),
+        Field.raw("dev_id", 4),
+        Field.raw("data", "{len.val}-7"),
+        Field.checksum("crc", 2, group="{len}{cmd}{dev_id}{data}"),
+    ],
+    payload="data",
+    length=LengthRule("len"),                    # length field: computed and backfilled
+    checksum=ChecksumRule("crc", crc16_modbus),  # checksum field: computed for you
+)
+
+proto = Protocol(AURORA)                 # parse and build from the same declaration
+
+for frame in proto.feed(chunk):          # chunk can be split at any byte
+    print(frame.value("cmd"), frame.value("data"))
+
+wire = proto.build_raw(0x03, b"hi", dev_id=b"\x00\x00\x00\x01")   # build
 ```
 
 ---
 
-## 2. 安装
+## 2. Install
 
 ```bash
 pip install kkprotocol
 ```
 
-从源码安装：
+From source:
 
 ```bash
 git clone <your-repo-url>
@@ -82,330 +107,102 @@ cd kkprotocol
 pip install -e .
 ```
 
-要求 Python 3.9+，无第三方运行时依赖。
+Python 3.9+, no third-party runtime dependencies.
 
 ---
 
-## 3. 30 秒上手
+## 3. Two APIs, pick one
 
-库自带一个可直接运行的示例帧 `DeviceFrameCodec`（长度定界）：
+**Use A by default. Only drop to B when you need to write parsing logic yourself.**
 
-```
-55 | len | ver | cmd | ser(2) | dev_id(4) | data(len-10) | crc(2, CRC16/MODBUS)
-len = ver..crc 的字节数
-```
+### 3.1 What they are
+
+| | **A. Declarative** `FrameSpec` | **B. Subclassing** `AbstractFrameCodec` |
+|---|---|---|
+| What you write | one `FrameSpec(...)` value | a class with `rules()` + `crc_imp()` |
+| Parsing | ✅ `Protocol(spec).feed()` / `spec.to_codec().feed()` | ✅ `MyCodec().feed()` |
+| Building | ✅ `Protocol(spec).build()`, length/checksum backfilled | ❌ not supported, assemble bytes yourself |
+| Length / checksum | `LengthRule` / `ChecksumRule` | length via field expressions, checksum via `crc_imp()` |
+| Good for | almost everything (**the default**) | when custom code is genuinely needed |
+
+Both share the **same `Field` table**, so switching costs almost nothing — that is why
+the field syntax in the first half of this README applies to both routes.
+
+### 3.2 The same frame, written both ways
+
+Using the `Aurora` frame that the rest of the README uses
+(`AA | len | type | cmd | seq(2) | dev(4) | data | crc(2)`):
+
+**Route A** — one spec handles both directions.
 
 ```python
-from kkprotocol import DeviceFrameCodec, build_device_frame
-
-wire = build_device_frame(
-    ver=1, cmd=0x03, ser=1, dev_id=b"\x00\x00\x00\x01", payload=b"\x01\x02"
+AURORA = FrameSpec(
+    fields=[...],                          # frame layout, see section 4
+    payload="data",                        # which segment is the payload
+    length=LengthRule("len"),              # which field is the length, and how to compute it
+    checksum=ChecksumRule("crc", crc16_modbus),
+    device="dev",                          # which field is the device id
 )
-print(wire.hex(" "))
-# 55 0C 01 03 00 01 00 00 00 01 01 02 D0 BD
+proto = Protocol(AURORA, device_id=b"\x00\x00\x00\x07")
+frame = proto.feed(wire)[0]                # parse
+wire = proto.build("Read", ...)            # build
+```
 
-codec = DeviceFrameCodec()
+**Route B** — a class that answers only two questions: what are the fields, and how is
+the checksum computed.
+
+```python
+class AuroraCodec(AbstractFrameCodec):
+    device_field = "dev"                   # class attr; A's device=
+
+    def rules(self):                       # A's fields=
+        return [ ... the exact same field table ... ]
+
+    def crc_imp(self, data):               # A's ChecksumRule
+        return crc16_modbus(data)
+
+frame = AuroraCodec().feed(wire)[0]        # parse only; no build()
+```
+
+Only three things differ: A takes `payload / length / checksum / device` as **arguments**,
+B takes them as **class attributes** and a method; and A gives you `build()`.
+
+### 3.3 Mixing: an A declaration is also a B codec
+
+```python
+codec = AURORA.to_codec()      # FrameSpec -> a plain codec instance
 frames = codec.feed(wire)
-frame = frames[0]
-print(frame.value("cmd"))       # 3
-print(frame.value("ser"))       # 1
-print(frame.value("data"))      # b'\x01\x02'
-print(frame.device_id)          # b'\x00\x00\x00\x01'
 ```
 
-把 `wire` 换成任意切分的块逐次 `feed`，结果都一样——这就是「黏包 / 半包自动处理」。
+So "I declared it with A, but here I really want a codec object" needs no rewrite.
+`Protocol` itself parses through this very path.
+
+### 3.4 When B is actually the right call
+
+- The field table must **change with the command code** (dynamic rules) — see
+  `contrib/bacnet_mstp.py` (two frame types) and `example_modbus_rtu_multi.py`
+  (dispatch over several specs by function code);
+- You need to override resync or device-learning behaviour;
+- Existing code already subclasses `AbstractFrameCodec` and you just want to add fields.
+
+Everything else is A: one class less to write, and you get building for free.
+
+> Sections 5–7 cover the **shared rules** (fields, framing, device id) that apply to both
+> routes. Each section notes how it is written in A (argument) vs B (attribute).
 
 ---
 
-## 4. 一帧怎么声明
+## 4. Quick start
 
-### 4.1 字段工厂
-
-`Field` 提供一组工厂方法，带完整 IDE 提示：
-
-```python
-from kkprotocol import Field
-
-Field.u8("cmd")                       # 1 字节无符号整数
-Field.u16("seq")                      # 2 字节无符号整数（默认大端）
-Field.u16("seq", little_endian=True)  # 2 字节小端
-Field.u32("ts")                       # 4 字节无符号整数
-Field.raw("dev_id", 4)                # 原始字节（不解析成数值，值就是 bytes）
-Field.rest("line")                    # “取到帧尾”（仅分隔符定界可用）
-Field.checksum("crc", 2, group="{len}{cmd}{data}")   # 校验字段
-```
-
-也支持完整构造与旧式字典（兼容历史代码）：
-
-```python
-Field(key="header", length=1, fmt="B", fixed=0x55)
-{"key": "header", "len": 1, "fmt": "B", "fixed": 0x55}
-```
-
-### 4.2 长度表达式
-
-`length` 可以是整数、数字字符串、表达式或回调：
-
-```python
-Field.raw("data", 16)                 # 固定 16 字节
-Field.raw("data", "{len.val}-8")      # len 字段的值减 8
-Field.raw("data", "{len.val}")        # 正好等于 len 字段的值
-Field.raw("line", None)               # 取到帧尾（分隔符定界）
-```
-
-表达式里 `{字段.属性}` 的属性只能是：
-
-| 属性 | 含义 |
-|---|---|
-| `val` | 字段解析出的**值**（整数） |
-| `len` / `length` / `bytes` / `raw` | 字段实际占用的**字节数** |
-
-### 4.3 `fmt`：解成什么
-
-`fmt` 是 `struct` 格式串，必须只解析出一个值。多字节数值请显式带字节序前缀
-（`!` 大端 / `<` 小端），避免平台差异。
-
-```python
-Field.u16("seq")                   # 内部就是 fmt="!H"
-Field.raw("payload", 4, fmt="!f")  # 4 字节大端单精度浮点
-```
-
-### 4.4 `group` 与 `crc_imp`：校验怎么算
-
-- 标记了 `group`（或 `crc=True`）的字段是**校验字段**；
-- `crc_imp(data) -> int | bytes` 给出算法；返回 `int` 按字段 `fmt` 打包，
-  返回 `bytes` 则直接使用（推荐返回 `bytes`，跨字节序最稳）；
-- `group` 决定参与校验的字段：
-
-```python
-Field.checksum("crc", 2, group="{len}{cmd}{data}")   # 校验 len、cmd、data
-Field.checksum("crc", 2)                             # 省略 group：校验它前面所有字段
-```
-
-内置算法：`crc16_modbus`、`crc16_x25`、`crc16_ccitt`、`crc8`、`sum8`、`xor8`。
-
----
-
-## 5. 三种定界方式
-
-| 方式 | 适用 | 切帧依据 | 是否需要转义 |
-|---|---|---|---|
-| 长度定界 `LENGTH_FRAMING` | TCP 二进制协议（首选） | 长度字段 | 否 |
-| 分隔符定界 `DelimiterFraming` | 串口 / 透传设备 / 文本协议 | 特殊字节 | 是 |
-| 自适应 `AUTO_FRAMING` | 不确定时兜底探测 | 先长度后分隔符 | 视情况 |
-
-### 5.1 长度定界（默认）
-
-```python
-class DevCodec(AbstractFrameCodec):
-    def rules(self):
-        return [
-            Field.u8("header", fixed=0x55),
-            Field.u8("len"),
-            Field.raw("data", "{len.val}-1"),
-            Field.checksum("crc", 2, group="{len}{data}"),
-        ]
-    def crc_imp(self, data):
-        return crc16_modbus(data)
-```
-
-长度字段一旦被破坏，协议本身无法自愈（会按错误长度等待）。用 `max_frame_size`
-把「假长度」尽快判死，配合 `idle_timeout` / `drop_pending()` 兜底（见第 9 节）。
-
-### 5.2 分隔符定界（含转义 / 透明传输）
-
-PPP / HDLC 风格：首尾 `0x7E`，净荷里的 `0x7E` / `0x7D` 转义为 `0x7D 0x5E` / `0x7D 0x5D`。
-
-```python
-from kkprotocol import AbstractFrameCodec, DelimiterFraming, Field, crc16_x25
-
-PPP = DelimiterFraming(end=0x7E, start=0x7E, escape=0x7D, escape_xor=0x20)
-
-class PppCodec(AbstractFrameCodec):
-    framing = PPP                      # 直接传 DelimiterFraming 实例
-    def rules(self):
-        return [
-            Field.u8("addr", fixed=0xFF),
-            Field.u8("ctrl", fixed=0x03),
-            Field.u8("len"),
-            Field.raw("data", "{len.val}"),
-            Field.checksum("fcs", 2, group="{addr}{ctrl}{len}{data}"),
-        ]
-    def crc_imp(self, data):
-        return crc16_x25(data)
-```
-
-要点：
-
-- 分隔符模式下**长度字段不能用来切帧**（转义会让线上长度 ≠ 净荷长度），只能作校验项；
-- `start == end` 表示首尾共用一个标志（PPP/HDLC）；两者不同时取两者之间；
-- 转义支持两种方案：`escape_xor`（异或，PPP）与 `escape_map`（显式映射，SLIP）；
-- `Field.rest("...")` 只能用于分隔符定界；若后面还跟着定长字段（如尾随 FCS），
-  它会自动**预留**这些字节，不会被 `rest` 吞掉。
-
-### 5.3 自适应 `AUTO_FRAMING`
-
-先用长度定界试探，失败回退到分隔符定界，命中一次后锁定：
-
-```python
-class MixedCodec(AbstractFrameCodec):
-    framing = AUTO_FRAMING
-    delimiter = DelimiterFraming(end=0x0A)
-    def rules(self):
-        return [Field.u8("stx", fixed=0x02), Field.u8("n"), Field.raw("body", "{n.val}")]
-    def crc_imp(self, data):
-        return 0
-```
-
----
-
-## 6. 帧首是设备号（未知 → 学到 → 固定）
-
-很多私有协议帧首不是固定帧头，而是**设备号**，且设备号在首帧未知。给它声明
-`device_field`，库会：
-
-1. 未知时先放行并**学习**设备号；
-2. 学到后把它还原成字节，当作**同步锚点**（比固定帧头更有辨识度）；
-3. 可选「学到即固定」——之后设备号不符的帧按脏数据丢掉。
-
-```python
-class HeadDeviceCodec(AbstractFrameCodec):
-    device_field = "dev_id"
-    sync_from_device = True         # 学到后拿设备号当同步字
-    lock_device_after_learn = True  # 学到即固定
-    max_frame_size = 300
-
-    def rules(self):
-        return [
-            Field.raw("dev_id", 4),
-            Field.u8("cmd"),
-            Field.u8("n"),
-            Field.raw("data", "{n.val}"),
-            Field.checksum("crc", 2, group="{dev_id}{cmd}{n}{data}"),
-        ]
-    def crc_imp(self, data):
-        return crc16_modbus(data)
-```
-
-多设备挂在同一条总线上时，请关掉 `lock_device_after_learn`，改为观察
-`frame.device_mismatch` 自行分派。
-
-| 属性 | 作用 |
-|---|---|
-| `device_field` | 哪个字段是设备号 |
-| `auto_learn_device` | 未知时自动学习（默认开） |
-| `enforce_device_id` | 不匹配直接拒绝（默认关，只标记 `device_mismatch`） |
-| `lock_device_after_learn` | 学到即固定 |
-| `sync_from_device` | 设备号兼作重同步锚点 |
-| `preempt_on_sync` | 候选帧被假长度堵住时，用锚点切断（启发式，默认关） |
-| `device_id_provider` | 设备号未知时从注册表/DB 拉取一次 |
-
----
-
-## 7. 异步与流式
-
-```python
-import asyncio
-from kkprotocol import DeviceFrameCodec
-
-async def main():
-    reader, writer = await asyncio.open_connection("10.0.0.10", 9000)
-    codec = DeviceFrameCodec()
-    codec.idle_timeout = 5.0            # 空闲 5 秒丢弃半包
-    async for frame in codec.read_frames(reader):
-        print(frame.value("cmd"), frame.value("data"))
-
-asyncio.run(main())
-```
-
-- `feed(chunk)`：同步、纯内存，最快路径；
-- `feed_async(chunk)`：超过 `offload_threshold`（默认 256KB）才丢线程池，避免阻塞事件循环；
-- `read_frames(reader)` / `iter_frames(chunks)`：直接对接 asyncio 流；
-- **一个连接一个 codec 实例**（缓冲区互不共享）。
-
----
-
-## 8. 解析结果怎么用
-
-`feed()` 返回 `Frame` 列表：
-
-```python
-frame = codec.feed(wire)[0]
-
-frame.value("cmd")          # 字段值
-frame["cmd"].raw            # 字段原始字节
-frame.raw_of("cmd")         # 同上
-frame.device_id             # 设备号（由 device_field 得出）
-frame.device_mismatch       # 与已绑定设备号不一致
-frame.learned_device        # 本帧触发了设备号学习
-frame.framing               # "length" / "delimiter"
-frame.to_bytes(wire=True)   # 这一帧在流里的实际字节（含定界符/转义）
-frame.to_hex()              # "55 0C 01 03 ..."
-frame.as_dict()             # {字段名: 值}
-```
-
-`FieldValue` 同时保留 `raw`（反转义后的原始字节）与 `val`（按 `fmt` 解出的值）；
-`fmt` 为空时 `val` 就是 `raw`。
-
----
-
-## 9. 出错、自愈与统计
-
-内部把「半包」与「脏数据」分开处理：
-
-- **半包** → 返回空列表，等下一次 `feed`（不丢数据）；
-- **脏数据** → 靠同步锚点（帧头 / 设备号）跳到下一个候选位置重新对齐；
-- **校验失败** → 整帧丢弃并重同步（`on_crc_error="resync"`），或跳过整帧（`"skip_frame"`）；
-- **长度与结构矛盾** → 计入 `length_mismatches`，整段候选丢弃。
-
-```python
-codec.stats.bytes_in             # 累计输入字节
-codec.stats.frames               # 成功解析帧数
-codec.stats.resyncs              # 重同步次数
-codec.stats.crc_errors           # 校验失败次数
-codec.stats.length_mismatches    # 长度不一致次数
-codec.stats.device_mismatches    # 设备号不匹配次数
-codec.stats.rejected_frames      # 被 on_frame 钩子拒绝的帧
-codec.stats.dropped_bytes        # 丢弃字节数
-codec.stats.overflow_drops       # 缓冲超限丢弃次数
-```
-
-兜底手段：
-
-```python
-codec.reset()            # 丢弃半包（重连时）
-codec.drop_pending()     # 主动丢弃当前未成帧的字节
-codec.reset_framing()    # auto 模式重新探测
-```
-
----
-
-## 10. 声明式组帧
-
-解析是「收」，组帧是「发」。组帧不能直接复用解析规则，因为三处不对称：
-
-| 解析（收） | 组帧（发） |
-|---|---|
-| 长度字段：读出来 | 长度字段：**算出来**并回填 |
-| 校验字段：验一遍 | 校验字段：**算一遍** |
-| 常量字段：对一下 | 常量字段：自动填 |
-
-所以用一份 `FrameSpec` 描述「要组出来的帧」，交给 `Protocol` 组帧；收发格式不同
-就写两份 `FrameSpec`（`Protocol(tx=..., rx=...)`）。
-
-### 10.1 三分钟上手
-
-虚构一个 `Aurora` 传感器协议：
+A made-up `Aurora` sensor protocol, used throughout this README:
 
 ```
 AA | len | type | cmd | seq(2) | dev(4) | data(len-10) | crc(2, CRC16/MODBUS)
-len = type..crc 的字节数
+len = number of bytes from type through crc
 ```
 
 ```python
-from kkprotocol import (
-    FrameSpec, Field, LengthRule, ChecksumRule, Protocol, crc16_modbus,
-)
+from kkprotocol import ChecksumRule, Field, FrameSpec, LengthRule, Protocol, crc16_modbus
 
 AURORA = FrameSpec(
     fields=[
@@ -425,32 +222,360 @@ AURORA = FrameSpec(
 )
 
 proto = Protocol(AURORA, device_id=b"\x00\x00\x00\x07")
-wire = proto.build_raw(None, b"\x10\x20", type=0x01, cmd=0x03, seq=1)
-print(wire.hex(" "))
-# AA 0C 01 03 00 01 00 00 00 07 10 20 98 D1
 
+# Build: length, checksum and device id are all computed and backfilled
+wire = proto.build_raw(0x03, b"\x10\x20", type=0x01, seq=1)
+print(wire.hex(" "))
+# aa 0c 01 03 00 01 00 00 00 07 10 20 98 d1
+
+# Parse: same object
 frame = proto.feed(wire)[0]
 print(frame.value("cmd"), frame.value("seq"), frame.value("data"))
 # 3 1 b'\x10 '
+
+# Self-check: the bytes we emit must parse back with our own receive rules
+proto.verify(wire)
 ```
 
-### 10.2 长度怎么回填：不动点循环
+Feed `wire` in blocks split at arbitrary positions and the result is identical — that is
+"sticky / partial packets handled".
 
-长度依赖帧体、帧体又包含长度字段，所以走**不动点循环**：假设 `len=0/crc=0` 拼一帧
-→ 量长度、算校验 → 与「帧里写的」比对 → 一致即收敛。通常 2~3 轮收敛。
+> Just want to see it run without writing a declaration? There is a ready-made
+> `DeviceFrameCodec` (section 12). For your own protocol, use `FrameSpec`.
 
-两种口径：
+---
 
-- `LengthRule("len")`（默认 `span=None`）：长度字段**之后到帧尾**的全部字节，**含校验字段**；
-- `LengthRule("len", span=("a", "b"))`：按字段名左闭右闭取一段，需要排除校验字段时用。
+## 5. Declaring a frame
 
-### 10.3 `Pdu`：一条指令怎么声明
+`Field` is the **shared language** of both routes: route A puts the list in
+`FrameSpec(fields=[...])`, route B returns it from `rules()`. Every field form below
+works in both.
+
+### 5.1 Field factories
+
+`Field` offers a set of factory methods with full IDE hints:
+
+```python
+from kkprotocol import Field
+
+Field.u8("cmd")                       # 1-byte unsigned int
+Field.u16("seq")                      # 2-byte unsigned int (big-endian by default)
+Field.u16("seq", little_endian=True)  # 2-byte little-endian
+Field.u32("ts")                       # 4-byte unsigned int
+Field.raw("dev_id", 4)                # raw bytes (value is bytes, not a number)
+Field.rest("line")                    # "to end of frame" (delimiter framing only)
+Field.checksum("crc", 2, group="{len}{cmd}{data}")   # checksum field
+```
+
+The full constructor and the legacy dict form are also accepted:
+
+```python
+Field(key="header", length=1, fmt="B", fixed=0x55)
+{"key": "header", "len": 1, "fmt": "B", "fixed": 0x55}
+```
+
+### 5.2 Length expressions
+
+`length` can be an int, a numeric string, an expression, or a callable:
+
+```python
+Field.raw("data", 16)                 # fixed 16 bytes
+Field.raw("data", "{len.val}-8")      # value of field len, minus 8
+Field.raw("data", "{len.val}")        # exactly the value of field len
+Field.raw("line", None)               # to end of frame (delimiter framing)
+```
+
+Inside an expression `{field.attr}` the attribute can only be:
+
+| Attribute | Meaning |
+|---|---|
+| `val` | the parsed **value** of the field (integer) |
+| `len` / `length` / `bytes` / `raw` | how many **bytes** the field occupies |
+
+### 5.3 `fmt`: what it decodes into
+
+`fmt` is a `struct` format string and must yield exactly one value. Always give an
+explicit byte-order prefix for multi-byte values (`!` big-endian / `<` little-endian).
+
+```python
+Field.u16("seq")                   # internally fmt="!H"
+Field.raw("payload", 4, fmt="!f")  # 4-byte big-endian float
+```
+
+### 5.4 `group`: which bytes the checksum covers
+
+- A field with `group` (or `crc=True`) is a **checksum field**;
+- `group` decides which fields take part:
+
+```python
+Field.checksum("crc", 2, group="{len}{cmd}{data}")   # checksum over len, cmd, data
+Field.checksum("crc", 2)                             # no group: everything before it
+```
+
+**How to supply the algorithm differs between routes:**
+
+| | Route A (`FrameSpec`) | Route B (subclass) |
+|---|---|---|
+| Where | `checksum=ChecksumRule("crc", crc16_modbus)` | `def crc_imp(self, data)` |
+| Returns | same contract as `crc_imp` | `int` (packed per field `fmt`) or `bytes` (used as-is) |
+
+Returning `bytes` is recommended — it is byte-order safe and independent of `fmt`.
+
+Built-in algorithms: `crc16_modbus`, `crc16_x25`, `crc16_ccitt`, `crc8`, `sum8`, `xor8`.
+
+---
+
+## 6. Three framing modes
+
+| Mode | Use for | Frame boundary | Escaping needed |
+|---|---|---|---|
+| Length `LENGTH_FRAMING` | binary TCP protocols (first choice) | length field | no |
+| Delimiter `DelimiterFraming` | serial / transparent links / text protocols | special byte | yes |
+| Auto `AUTO_FRAMING` | probing when unsure | length first, then delimiter | depends |
+
+How to set it: route A passes `FrameSpec(framing=...)`, route B sets the class attribute
+`framing = ...` — same values. The examples below use route B so you can see that framing
+is a property of the codec; for A, pass the same value as an argument.
+
+### 6.1 Length framing (default)
+
+```python
+class DevCodec(AbstractFrameCodec):
+    def rules(self):
+        return [
+            Field.u8("header", fixed=0x55),
+            Field.u8("len"),
+            Field.raw("data", "{len.val}-1"),
+            Field.checksum("crc", 2, group="{len}{data}"),
+        ]
+    def crc_imp(self, data):
+        return crc16_modbus(data)
+```
+
+Once a length field is corrupted, the protocol cannot heal itself (it waits for the wrong
+number of bytes). Use `max_frame_size` to kill bogus lengths early, plus `idle_timeout` /
+`drop_pending()` as a safety net (see section 10).
+
+### 6.2 Delimiter framing (with escaping / transparency)
+
+PPP / HDLC style: `0x7E` at both ends, with `0x7E` / `0x7D` inside the payload escaped to
+`0x7D 0x5E` / `0x7D 0x5D`.
+
+```python
+from kkprotocol import AbstractFrameCodec, DelimiterFraming, Field, crc16_x25
+
+PPP = DelimiterFraming(end=0x7E, start=0x7E, escape=0x7D, escape_xor=0x20)
+
+class PppCodec(AbstractFrameCodec):
+    framing = PPP                      # accepts a DelimiterFraming instance
+    def rules(self):
+        return [
+            Field.u8("addr", fixed=0xFF),
+            Field.u8("ctrl", fixed=0x03),
+            Field.u8("len"),
+            Field.raw("data", "{len.val}"),
+            Field.checksum("fcs", 2, group="{addr}{ctrl}{len}{data}"),
+        ]
+    def crc_imp(self, data):
+        return crc16_x25(data)
+```
+
+Notes:
+
+- In delimiter mode a length field **must not** be used to cut frames (escaping makes the
+  on-wire length differ from the payload length); it is only a checksum input;
+- `start == end` means one shared flag (PPP/HDLC); different values mean "between them";
+- Two escaping schemes are supported: `escape_xor` (PPP) and `escape_map` (SLIP);
+- `Field.rest("...")` only works in delimiter framing; if fixed-length fields follow
+  (a trailing FCS, say), the reserved bytes are **excluded** from `rest` automatically.
+
+### 6.3 Auto `AUTO_FRAMING`
+
+Probe length framing first, fall back to delimiter framing, then lock onto whichever hit:
+
+```python
+class MixedCodec(AbstractFrameCodec):
+    framing = AUTO_FRAMING
+    delimiter = DelimiterFraming(end=0x0A)
+    def rules(self):
+        return [Field.u8("stx", fixed=0x02), Field.u8("n"), Field.raw("body", "{n.val}")]
+    def crc_imp(self, data):
+        return 0
+```
+
+---
+
+## 7. Device id at the frame head
+
+Many private protocols lead with a **device id** instead of a fixed header, and that id is
+unknown for the very first frame. Declare which field it is — route A:
+`FrameSpec(device="dev_id")`, route B: `device_field = "dev_id"` — and the codec will:
+
+1. let the first frame through and **learn** the id;
+2. once learned, use its bytes as a **sync anchor** (far more distinctive than a fixed header);
+3. optionally "lock after learn" — later frames with a different id are treated as garbage.
+
+```python
+class HeadDeviceCodec(AbstractFrameCodec):
+    device_field = "dev_id"
+    sync_from_device = True         # use the learned id as the resync token
+    lock_device_after_learn = True  # lock once learned
+    max_frame_size = 300
+
+    def rules(self):
+        return [
+            Field.raw("dev_id", 4),
+            Field.u8("cmd"),
+            Field.u8("n"),
+            Field.raw("data", "{n.val}"),
+            Field.checksum("crc", 2, group="{dev_id}{cmd}{n}{data}"),
+        ]
+    def crc_imp(self, data):
+        return crc16_modbus(data)
+```
+
+With several devices on one bus, turn `lock_device_after_learn` off and dispatch on
+`frame.device_mismatch` yourself.
+
+In route A only `device=` is a spec argument; the other policies live on the codec and are
+set through `Protocol.codec` (`codec` is a lazily created property):
+
+```python
+proto = Protocol(AURORA, device_id=b"\x00\x00\x00\x07")
+proto.codec.sync_from_device = True
+proto.codec.lock_device_after_learn = True
+```
+
+| Attribute | Effect |
+|---|---|
+| `device_field` (A: `device=`) | which field holds the device id |
+| `auto_learn_device` | learn when unknown (on by default) |
+| `enforce_device_id` | reject mismatches outright (off by default; only sets `device_mismatch`) |
+| `lock_device_after_learn` | lock the id once learned |
+| `sync_from_device` | use the device id as a resync anchor |
+| `preempt_on_sync` | cut a candidate frame blocked by a bogus length (heuristic, off by default) |
+| `device_id_provider` | fetch an unknown id from a registry/DB once |
+
+---
+
+## 8. Async and streaming
+
+```python
+import asyncio
+from kkprotocol import DeviceFrameCodec
+
+async def main():
+    reader, writer = await asyncio.open_connection("127.0.0.1", 9000)
+    codec = DeviceFrameCodec()
+    codec.idle_timeout = 5.0            # drop a half frame after 5s idle
+    async for frame in codec.read_frames(reader):
+        print(frame.value("cmd"), frame.value("data"))
+
+asyncio.run(main())
+```
+
+- `feed(chunk)`: synchronous, pure in-memory, the fast path;
+- `feed_async(chunk)`: only offloads to a thread pool above `offload_threshold`
+  (256 KB default), so the event loop stays responsive;
+- `read_frames(reader)` / `iter_frames(chunks)`: turn asyncio streams into frame iterators;
+- **One codec instance per connection** (buffers are never shared).
+
+---
+
+## 9. Working with parsed frames
+
+`feed()` returns a list of `Frame`:
+
+```python
+frame = codec.feed(wire)[0]
+
+frame.value("cmd")          # decoded value
+frame["cmd"].raw            # raw bytes of that field
+frame.raw_of("cmd")         # same thing
+frame.device_id             # device id (from device_field)
+frame.device_mismatch       # differs from the bound device id
+frame.learned_device        # this frame triggered device learning
+frame.framing               # "length" / "delimiter"
+frame.to_bytes(wire=True)   # the exact bytes as they appeared on the wire (incl. framing/escapes)
+frame.to_hex()              # "55 0C 01 03 ..."
+frame.as_dict()             # {field name: value}
+```
+
+`FieldValue` keeps both `raw` (bytes after unescaping) and `val` (decoded per `fmt`);
+when `fmt` is empty, `val` is `raw`.
+
+---
+
+## 10. Errors, resync and stats
+
+Internally "half frame" and "garbage" are handled separately:
+
+- **Half frame** → returns an empty list, waits for the next `feed` (no data lost);
+- **Garbage** → jump to the next candidate position using the sync anchor (header / device id);
+- **Checksum failure** → drop the whole frame and resync (`on_crc_error="resync"`),
+  or skip it entirely (`"skip_frame"`);
+- **Length vs structure contradiction** → counted in `length_mismatches`, candidate dropped.
+
+```python
+codec.stats.bytes_in             # total bytes received
+codec.stats.frames               # frames parsed successfully
+codec.stats.resyncs              # resync count
+codec.stats.crc_errors           # checksum failures
+codec.stats.length_mismatches    # length inconsistencies
+codec.stats.device_mismatches    # device id mismatches
+codec.stats.rejected_frames      # frames rejected by the on_frame hook
+codec.stats.dropped_bytes        # bytes discarded
+codec.stats.overflow_drops       # buffer overflow drops
+```
+
+Escape hatches:
+
+```python
+codec.reset()            # drop pending bytes (on reconnect)
+codec.drop_pending()     # drop whatever has not formed a frame
+codec.reset_framing()    # re-probe in auto mode
+```
+
+---
+
+## 11. Building frames in depth
+
+Section 4 already showed build-and-parse end to end. This section covers the mechanics.
+
+One common misunderstanding first: **a single `FrameSpec` serves both building (`build`)
+and parsing (`feed`)** — building does *not* need a different rule set. `Protocol` parses
+by calling `rx.to_codec()`, turning the same declaration into a codec. You only write a
+second spec when the two directions genuinely differ (an ack that omits fields, a command
+code offset by `0x80`), and hand it to `Protocol(tx=..., rx=...)`.
+
+Only three things are actually asymmetric, and the builder handles them:
+
+| Declared as | When parsing | When building |
+|---|---|---|
+| length field | read it | **compute** and backfill |
+| checksum field | verify it | **compute** it |
+| constant field `fixed=` | compare it | fill it in |
+
+### 11.1 Length backfill: a fixed-point loop
+
+The length depends on the body, which contains the length field, so the builder runs a
+**fixed-point loop**: assume `len=0/crc=0`, assemble a frame, measure it and compute the
+checksum, compare with what the frame says, and repeat. Typically 2–3 rounds.
+
+Two conventions:
+
+- `LengthRule("len")` (`span=None`, default): everything **after the length field to the
+  end of the frame**, **including** the checksum;
+- `LengthRule("len", span=("a", "b"))`: a field-name range, both ends inclusive — use it
+  when the checksum must be excluded.
+
+### 11.2 `Pdu`: declaring one command
 
 ```python
 from kkprotocol import Pdu
 
 AURORA_WITH_PDU = FrameSpec(
-    fields=[...],                       # 同上
+    fields=[...],                       # same as above
     pdus={
         0x03: Pdu("Read", [Field.u8("addr"), Field.u8("count")]),
         0x06: Pdu("Write", [Field.u8("addr"), Field.u16("value")]),
@@ -463,16 +588,19 @@ wire = proto.build(0x06, type=0x01, seq=2, addr=0x2C, value=250)
 # AA 0D 01 06 00 02 00 00 00 07 2C 00 FA 15 AC
 ```
 
-命令码不用写两遍：`pdus` 的键就是命令码，声明时自动回填进 `Pdu.cmd`。上面等价于
-`Pdu("Read", 0x03, [...])`——显式写法也仍然支持，两者不一致会在声明期直接报错
-（**不允许**键和 `Pdu.cmd` 打架）。第二位置参数直接给字段表即可，命令码只会是标量，
-不可能是序列，所以不存在歧义。
+The command code is never written twice: the key of `pdus` *is* the command code and is
+backfilled into `Pdu.cmd`. The explicit form `Pdu("Read", 0x03, [...])` also works; if the
+two disagree, declaration raises immediately (key and `Pdu.cmd` may not fight). The second
+positional argument may be the field list directly — a command code is always a scalar,
+never a sequence, so there is no ambiguity.
 
-`Pdu.resp` 用来显式指定应答命令码（默认 `cmd | 0x80`）：`Pdu("Read", resp=0x83)`。
+`Pdu.resp` pins the ack command code explicitly (default `cmd | 0x80`):
+`Pdu("Read", resp=0x83)`.
 
-### 10.4 设备号与自动填值字段
+### 11.3 Device id and auto fields
 
-除了长度、校验、设备号，其余「每帧自己变」的字段用 `AutoField` 声明，可 0..N 个：
+Besides length, checksum and device id, any field that changes every frame is declared as
+an `AutoField`; 0..N of them are allowed:
 
 ```python
 import time
@@ -481,51 +609,77 @@ from kkprotocol import AutoField
 TIME_AND_SEQ = FrameSpec(
     fields=[...],
     auto=[
-        AutoField("seq", start=0, step=1, wrap=0x10000),               # 自增计数器
-        AutoField("ts", provider=lambda: int(time.time()) & 0xFFFF),   # 时间戳
+        AutoField("seq", start=0, step=1, wrap=0x10000),               # auto-increment counter
+        AutoField("ts", provider=lambda: int(time.time()) & 0xFFFF),   # timestamp
     ],
 )
 ```
 
-- `provider=None`：自增计数器；
-- `provider=callable`：每次组帧调用取值；
-- `echo=True`：`build_ack()` 回显请求帧里的同名字段（应答通常要带回 SEQ）。
+- `provider=None`: an incrementing counter;
+- `provider=callable`: called once per build;
+- `echo=True`: `build_ack()` echoes the same field from the request (acks usually carry
+  the sequence number back).
 
-### 10.5 发出去之前先自检
+### 11.4 Self-check before sending
 
 ```python
 proto = Protocol(AURORA, device_id=b"\x00\x00\x00\x07")
 wire = proto.build_raw(None, b"\x10\x20", type=1, cmd=3, seq=1)
-frame = proto.verify(wire)      # 用收帧规则回环解析，必须一帧一字节不剩
-proto.diff()                    # 收发两份 spec 的差异（tx/rx 不同时）
+frame = proto.verify(wire)      # parse with the receive rules: exactly one frame, no leftovers
+proto.diff()                    # differences between the tx and rx specs (when they differ)
 ```
 
 ---
 
-## 11. 内置协议示例
+## 12. Bundled protocols and examples
 
-`kkprotocol.example_device` 里有两个可直接跑、也是写自己协议时的模板：
+### 12.1 A ready-to-run example frame
 
-- `DeviceFrameCodec`：长度定界 + 设备号；
-- `PppFrameCodec`：`0x7E` 定界 + `0x7D` 转义；
-- `HeadDeviceFrameCodec`：帧首即设备号（首帧未知）。
+`kkprotocol.example_device` ships three **route B** codecs that double as templates:
 
-`kkprotocol.contrib` 里是若干**公共标准协议**的落地示例（仅作压测与参考，**不进顶层
-导出**，按需 `import`）：
+- `DeviceFrameCodec`: length framing + device id;
+- `PppFrameCodec`: `0x7E` delimiter + `0x7D` escaping;
+- `HeadDeviceFrameCodec`: device id at the frame head (unknown at first).
 
-| 协议 | 定界 | 校验 | 模块 |
+`DeviceFrameCodec` uses
+`55 | len | ver | cmd | ser(2) | dev_id(4) | data(len-10) | crc(2, CRC16/MODBUS)`:
+
+```python
+from kkprotocol import DeviceFrameCodec, build_device_frame
+
+wire = build_device_frame(
+    ver=1, cmd=0x03, ser=1, dev_id=b"\x00\x00\x00\x01", payload=b"\x01\x02"
+)
+print(wire.hex(" "))
+# 55 0c 01 03 00 01 00 00 00 01 01 02 d0 bd
+
+codec = DeviceFrameCodec()
+frame = codec.feed(wire)[0]
+print(frame.value("cmd"), frame.value("ser"), frame.value("data"), frame.device_id)
+# 3 1 b'\x01\x02' b'\x00\x00\x00\x01'
+```
+
+Run it once to get a feel; for your own protocol, change the fields of the `FrameSpec`
+from section 4.
+
+### 12.2 Public protocols (contrib)
+
+`kkprotocol.contrib` contains implementations of **public standards** (regression and
+reference only — **not exported at the top level**, import as needed):
+
+| Protocol | Framing | Checksum | Module |
 |---|---|---|---|
-| DL/T645-2007（电能表） | 长度 + `0x68` | 累加和 | `contrib.dlt645` |
-| CJ/T188-2004（水/气/热表） | 长度 + `0x68` | 累加和 | `contrib.cjt188` |
-| M-Bus（EN 13757） | 长度，双长度字节 | 累加和 | `contrib.mbus` |
-| ccTalk（货币外设） | 长度，无帧头 | 零和 | `contrib.cctalk` |
-| XModem / YModem | 固定帧长 | CRC-16/CCITT | `contrib.xmodem` |
-| SLIP（RFC 1055） | 分隔符 `0xC0` | 无 | `contrib.slip` |
-| HDLC / PPP | 分隔符 `0x7E` + 转义 | CRC-16 | `contrib.hdlc` |
-| Art-Net | 长度 + 多字节 magic | 无 | `contrib.artnet` |
-| Modbus ASCII | 分隔符 `:`…`\n`，ASCII-Hex | LRC | `contrib.modbus_ascii` |
-| NMEA-0183 | 分隔符 `$`…`\n`，文本 | 内联 XOR | `contrib.nmea` |
-| BACnet MS/TP | 长度 + `55 FF`，双 CRC | 头 CRC8 + 体 CRC16 | `contrib.bacnet_mstp` |
+| DL/T645-2007 (electricity meter) | length + `0x68` | byte sum | `contrib.dlt645` |
+| CJ/T188-2004 (water/gas/heat meter) | length + `0x68` | byte sum | `contrib.cjt188` |
+| M-Bus (EN 13757) | length, two length bytes | byte sum | `contrib.mbus` |
+| ccTalk (currency peripherals) | length, no header | zero-sum | `contrib.cctalk` |
+| XModem / YModem | fixed frame size | CRC-16/CCITT | `contrib.xmodem` |
+| SLIP (RFC 1055) | delimiter `0xC0` | none | `contrib.slip` |
+| HDLC / PPP | delimiter `0x7E` + escaping | CRC-16 | `contrib.hdlc` |
+| Art-Net | length + multi-byte magic | none | `contrib.artnet` |
+| Modbus ASCII | delimiter `:`…`\n`, ASCII-hex | LRC | `contrib.modbus_ascii` |
+| NMEA 0183 | delimiter `$`…`\n`, text | inline XOR | `contrib.nmea` |
+| BACnet MS/TP | length + `55 FF`, two CRCs | header CRC8 + body CRC16 | `contrib.bacnet_mstp` |
 
 ```python
 from kkprotocol.contrib import dlt645
@@ -535,96 +689,117 @@ frame = dlt645.protocol(b"\x01\x00\x00\x00\x00\x00").feed(wire)[0]
 print(dlt645.decode_data(frame.value("data")))   # b'\x10\x01'
 ```
 
-> 一帧多校验和（如 BACnet 的头 CRC + 体 CRC）解析侧已完整支持：`FrameSpec.checksum`
-> 接受 `ChecksumRule` 列表，每个校验字段按各自算法独立校验。组帧侧仍只回填第一个。
+> Frames with more than one checksum (BACnet's header CRC + body CRC, for example) are
+> fully supported when parsing: `FrameSpec.checksum` accepts a list of `ChecksumRule`, and
+> each checksum field is verified with its own algorithm. When building, only the first
+> one is backfilled.
 
 ---
 
-## 12. 常见坑
+## 13. Pitfalls
 
-1. **把可变字段写成 `fixed`**：序列号、时间戳写死就整帧报废。
-2. **`{n.val}` 与 `{n.len}` 用混**：前者是字段**值**，后者是字段**占几字节**。
-   按长度字段算净荷要 `{len.val}`，写成 `{len.len}` 会永远只跳过 1~2 字节。
-3. **长度表达式里写 `{n}`（不带属性）**：编译期报错；`{n}` 只能出现在校验 `group` 里。
-4. **对 `fmt=""` 的字段用 `.val`**：`Field.raw("dev", 4)` 的值是 `bytes`，要用 `{dev.len}`。
-5. **`Field.checksum` 的 `fmt` 与 `length` 不一致**：`fmt` 会按 `length` 自动选，
-   手写 `fmt="!H"` 却声明 `length=1` 会编译期报错。
-6. **`max_frame_size` 用默认 64KB**：假长度声称 65535 时会长时间等待，按真实最大值收紧。
-7. **分隔符定界忘了转义**：净荷里出现定界字节会切断帧，且 CRC 未必能救。
-8. **`crc_imp` 返回 `int` 但 `fmt` 字节序写反**：校验永远不过且不报错，只是不断重同步；
-   优先返回 `bytes`。
-9. **`Field.rest()` 用在长度定界**：编译期报错（长度定界没有「帧尾」概念）。
-10. **长度表达式引用后面的字段**：编译期报错（只能前向引用）。
-11. **多个连接复用同一个 codec 实例**：缓冲区会串，一个连接一个实例。
-12. **组帧时手动传 `len`/`crc`**：会被拒绝，这两个字段由 builder 计算。
-13. **`ChecksumRule.impl` 每次返回不同结果**：不动点循环无法收敛，报「来回震荡」。
-14. **收发复用一份 spec 却格式不同**：发得出、收不回。写两份交给 `Protocol(tx=..., rx=...)`。
-15. **载荷长度表达式偏移写错**：组帧末尾的一致性核对会拦下来，提示「对面按同一规则解析会错位」。
+1. **Marking a variable field `fixed`**: a hard-coded sequence number or timestamp kills
+   every frame.
+2. **Mixing up `{n.val}` and `{n.len}`**: the former is the field's **value**, the latter
+   is how many **bytes** it occupies. Payload size from a length field is `{len.val}`;
+   `{len.len}` always skips 1–2 bytes.
+3. **Writing `{n}` (no attribute) in a length expression**: compile-time error; `{n}` is
+   only valid inside a checksum `group`.
+4. **Using `.val` on an `fmt=""` field**: `Field.raw("dev", 4)` yields `bytes`; use `{dev.len}`.
+5. **`fmt` inconsistent with `length` in `Field.checksum`**: `fmt` is derived from
+   `length`; writing `fmt="!H"` while declaring `length=1` fails at compile time.
+6. **Leaving `max_frame_size` at its 64 KB default**: a bogus length claiming 65535 keeps
+   you waiting; tighten it to the real maximum.
+7. **Forgetting escaping in delimiter framing**: a delimiter byte inside the payload cuts
+   the frame, and the CRC may not save you.
+8. **`crc_imp` returning `int` with a wrong `fmt` byte order**: checksums never pass and
+   nothing errors — you just keep resyncing. Prefer returning `bytes`.
+9. **`Field.rest()` in length framing**: compile-time error (length framing has no
+   "end of frame").
+10. **A length expression referencing a later field**: compile-time error (forward
+    references only).
+11. **Sharing one codec instance across connections**: buffers interleave. One instance
+    per connection.
+12. **Passing `len`/`crc` by hand when building**: rejected — the builder computes both.
+13. **`ChecksumRule.impl` returning a different value each call**: the fixed-point loop
+    cannot converge and reports oscillation.
+14. **Reusing one spec when tx and rx differ**: it builds but will not parse. Write two
+    specs and pass `Protocol(tx=..., rx=...)`.
+15. **A wrong offset in the payload length expression**: the end-of-build consistency
+    check catches it and warns that the peer will misalign under the same rule.
 
 ---
 
-## 13. API 速查
+## 14. API cheat sheet
+
+Three blocks: what **both routes share** (`Field` / exceptions), then **route A**, then
+**route B**.
 
 ```python
-# 你必须实现（子类化 AbstractFrameCodec）
-rules() -> Sequence[Field]          # 帧结构
-crc_imp(data: bytes) -> int|bytes   # 校验算法
-
-# Field 工厂
+# ============ Shared: Field factories (A: FrameSpec.fields, B: return from rules()) ============
 Field.u8 / u16 / u32 / u64 / raw / rest / checksum
 Field(key=..., length=..., fmt=..., fixed=..., group=..., crc=..., desc=...)
-#   length: int | "10" | "{len.val}-8" | callable(fields) | None(取到帧尾)
+#   length: int | "10" | "{len.val}-8" | callable(fields) | None (to end of frame)
 #   fmt:    ""(bytes) | "B" | "!H" | "<H" | "!I" | "!Q" | "!f" | "4s" ...
-#   group:  "{n}{cmd}{body}"（只写 {字段}，不带属性）
+#   group:  "{n}{cmd}{body}"  (field names only, no attributes)
 
-# 定界与策略（类属性）
+# Shared: exceptions
+FrameRuleError     # bad rule, should surface at startup
+FrameBuildError    # these arguments/data cannot produce a valid frame
+
+# ============ Route A: declarative (FrameSpec + Protocol) ============
+FrameSpec(fields, framing, payload, cmd, length, checksum, pdus, device, seq, auto, max_frame_size)
+  .to_codec() -> AbstractFrameCodec   # turn it into a plain codec instance
+  .pdu(target) / .field(key) / .field_keys() / .group_keys(key)
+  .diff(other) -> List[str]
+LengthRule(key, span=None)          # span=None: after the length field to end of frame (incl. checksum)
+ChecksumRule(key, impl)             # impl returns int (packed per fmt) or bytes (used as-is)
+                                    #   multiple checksums: checksum=[ChecksumRule(...), ChecksumRule(...)]
+SeqPolicy(key, enabled=False, start=0, step=1, wrap=0x10000)   # one counter
+AutoField(key, start=0, step=1, wrap=0x10000, provider=None, echo=True)  # 0..N of them
+Pdu(name, cmd=None, fields=(), resp=None)   # cmd optional: backfilled from the pdus key
+
+Protocol(tx=SPEC, rx=SPEC2, device_id=..., enforce_device_id=False, max_rounds=8)
+  .build(target, **fields)             # command name / code / Pdu -> wire bytes
+  .build_frame(target, **fields)       # returns BuildResult(trace/values/body/rounds)
+  .build_raw(target, payload, **shell) # whole payload at once, no Pdu.fields packing
+  .build_ack(frame, **fields)          # ack: cmd|0x80 (or Pdu.resp), seq/device echoed
+  .feed(data) / .verify(wire) / .diff()
+  .codec                               # underlying codec (for sync_from_device etc.)
+
+FrameBuilder(spec, device_id=..., max_rounds=8)      # lightweight build-only entry point
+  .build / .build_frame / .build_raw / .device_id / .seq / .auto_keys
+
+# ============ Route B: subclassing (AbstractFrameCodec) ============
+# Must implement
+rules() -> Sequence[Field]          # frame layout
+crc_imp(data: bytes) -> int|bytes   # checksum algorithm
+
+# Class attributes: framing and policies
 framing / delimiter / sync / lock_framing
 max_frame_size / max_buffer / on_crc_error
 device_field / auto_learn_device / enforce_device_id / device_id_provider
 lock_device_after_learn / sync_from_device / preempt_on_sync
 offload_threshold / idle_timeout / drop_pending_on_idle
 
-# 数据入口
+# Data entry points
 feed(data) / filter(data) / feed_async(data) / read_frames(reader) / iter_frames(chunks)
 
-# 生命周期
+# Lifecycle
 compile() / reset() / reset_framing() / drop_pending()
 bind_device(x) / forget_device()
 pending_bytes / framing_mode / device_id / stats
 
-# 钩子
+# Hooks
 on_frame(frame) -> bool
 on_device_learned(device_id, frame)
-
-# 组帧
-Protocol(tx=SPEC, rx=SPEC2, device_id=..., enforce_device_id=False, max_rounds=8)
-build(target, **fields)             # 指令名 / 命令码 / Pdu → 线上字节
-build_frame(target, **fields)       # 返回 BuildResult(轨迹/字段/body/rounds)
-build_raw(target, payload, **shell) # 载荷整段给，不按 Pdu.fields 打包
-build_ack(frame, **fields)          # 应答：cmd|0x80（或 Pdu.resp），seq/device 回显
-feed(data) / verify(wire) / diff()
-
-FrameSpec(fields, framing, payload, cmd, length, checksum, pdus, device, seq, auto, max_frame_size)
-LengthRule(key, span=None)          # span=None：长度字段之后到帧尾（含校验）
-ChecksumRule(key, impl)             # impl 返回 int（按 fmt 打包）或 bytes（直接用）
-                                    #   一帧多校验和：checksum=[ChecksumRule(...), ChecksumRule(...)]
-SeqPolicy(key, enabled=False, start=0, step=1, wrap=0x10000)   # 单个计数器
-AutoField(key, start=0, step=1, wrap=0x10000, provider=None, echo=True)  # 可 0..N 个
-Pdu(name, cmd=None, fields=(), resp=None)   # cmd 可省略：pdus 的键回填
-
-FrameBuilder(spec, device_id=..., max_rounds=8)
-  .build / .build_frame / .build_raw / .device_id / .seq / .auto_keys
-
-# 异常
-FrameRuleError     # 规则写错，启动期就该暴露
-FrameBuildError    # 这次的参数/数据凑不出合法帧
 ```
 
-内置 CRC：`crc16_modbus`、`crc16_x25`、`crc16_ccitt`、`crc8`、`sum8`、`xor8`。
+Built-in CRCs: `crc16_modbus`, `crc16_x25`, `crc16_ccitt`, `crc8`, `sum8`, `xor8`.
 
 ---
 
-## 14. 测试与性能
+## 15. Tests and performance
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
@@ -632,16 +807,19 @@ python -m coverage run --source=kkprotocol -m unittest discover -s tests -p "tes
 python -m coverage report -m
 ```
 
-- **591 个用例全部通过**（下面的命令可复现，用的是标准库 `unittest`，无需装 pytest）；
-- 覆盖：黏包 / 逐字节分片 / 脏前缀 / 坏校验 / 设备号学习 / 多帧分派 / 异步 /
-  长度回填收敛 / 分隔符转义 / 一帧多校验和 / `rest` 尾字段预留；
-- 另有 11 个真实公共协议的批量回归（`tests/test_contrib_protocols.py`）。
+- **591 tests, all passing** (reproducible with the commands above; stdlib `unittest`
+  only, no pytest needed);
+- Coverage: sticky packets / byte-by-byte splits / garbage prefixes / bad checksums /
+  device learning / multi-frame dispatch / async / fixed-point convergence / delimiter
+  escaping / multiple checksums per frame / `rest` tail reservation;
+- Plus a batch regression over 11 real public protocols (`tests/test_contrib_protocols.py`).
 
-参考量级（纯 Python 校验，440 字节/帧）：单连接 2~4 万帧/s；单连接 200Hz × 8 通道
-（约 1600 帧/s）绰绰有余。瓶颈通常在对端与业务处理，不在解析器。
+Rough numbers (pure-Python checksum, 200-byte frames): 20k–40k frames/s per connection;
+200 Hz × 8 channels (about 1600 frames/s) is comfortably within budget. The bottleneck is
+usually the peer or your business logic, not the parser.
 
 ---
 
-## 15. License
+## 16. License
 
-MIT License. 详见仓库中的 `LICENSE` 文件。
+MIT License. See the `LICENSE` file in this repository.
