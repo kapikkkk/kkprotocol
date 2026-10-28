@@ -632,7 +632,7 @@ python -m coverage run --source=kkprotocol -m unittest discover -s tests -p "tes
 python -m coverage report -m
 ```
 
-- **606 个用例全部通过**（下面的命令可复现，用的是标准库 `unittest`，无需装 pytest）；
+- **591 个用例全部通过**（下面的命令可复现，用的是标准库 `unittest`，无需装 pytest）；
 - 覆盖：黏包 / 逐字节分片 / 脏前缀 / 坏校验 / 设备号学习 / 多帧分派 / 异步 /
   长度回填收敛 / 分隔符转义 / 一帧多校验和 / `rest` 尾字段预留；
 - 另有 11 个真实公共协议的批量回归（`tests/test_contrib_protocols.py`）。
