@@ -2,7 +2,7 @@
 
 **可声明、可组帧、可自愈的 TCP 流式自定义帧解析器。**
 
-[English](README.md) | 简体中文
+[English](https://github.com/kapikkkk/kkprotocol/blob/main/README.md) | 简体中文
 
 `kkprotocol` 面向「私有二进制协议」场景：设备通过 TCP / 串口服务器吐出一串字节，
 你只负责**声明帧长什么样**，剩下的黏包、半包、脏数据重同步、长度回填、校验计算

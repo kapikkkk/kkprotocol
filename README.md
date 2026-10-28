@@ -2,7 +2,7 @@
 
 **Declarative, self-resynchronizing frame codec for streaming custom protocols.**
 
-English | [简体中文](README.zh-CN.md)
+English | [简体中文](https://github.com/kapikkkk/kkprotocol/blob/main/README.zh-CN.md)
 
 `kkprotocol` targets *private binary protocols*: a device dumps bytes onto TCP or a
 serial-to-Ethernet converter, and all you do is **declare what a frame looks like** —
