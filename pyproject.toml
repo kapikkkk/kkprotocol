@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kkprotocol"
+version = "1.0.0"
+description = "Declarative TCP/serial frame codec: parse, build, and self-resync private binary protocols."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "kkprotocol contributors" }]
+keywords = [
+    "tcp", "serial", "protocol", "frame", "codec", "parser",
+    "length-prefix", "delimiter", "crc", "iot", "modbus", "bacnet",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/your-account/kkprotocol"
+Repository = "https://github.com/your-account/kkprotocol"
+"Bug Tracker" = "https://github.com/your-account/kkprotocol/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["kkprotocol*"]
+
+[tool.setuptools.package-data]
+kkprotocol = ["py.typed"]
+
+[tool.coverage.run]
+source = ["kkprotocol"]
+
+[tool.coverage.report]
+show_missing = true
