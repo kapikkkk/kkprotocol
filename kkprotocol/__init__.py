@@ -30,10 +30,11 @@
 from .builder import BuildResult, FrameBuilder, Protocol
 from .codec import AbstractFrameCodec, CodecStats
 from .compiler import CompiledField, compile_rules
-from .crc import crc16_modbus, crc16_x25, sum8, xor8
+from .crc import crc16_ccitt, crc16_modbus, crc16_x25, crc8, sum8, xor8
 from .errors import FrameBuildError, FrameCodecError, FrameRuleError
 from .fields import Field
 from .frame import FieldValue, Frame
+from .pack import Data, pack
 from .spec import AutoField, ChecksumRule, FrameSpec, LengthRule, Pdu, SeqPolicy
 from .framing import (
     AUTO_FRAMING,
@@ -85,12 +86,16 @@ __all__ = [
     "Protocol",
     "SeqPolicy",
     "AutoField",
+    "Data",
+    "pack",
     "build_device_frame",
     "build_head_device_frame",
     "build_ppp_frame",
     "compile_rules",
+    "crc16_ccitt",
     "crc16_modbus",
     "crc16_x25",
+    "crc8",
     "escape_bytes",
     "find_end_delimiter",
     "sum8",

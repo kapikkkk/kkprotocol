@@ -256,10 +256,9 @@ source, and anything derivable is not your business:
 One rule covers all of it: **pass a field only when it can neither be derived nor is a
 constant.**
 
-The payload segment has a second form: once `pdus` is declared you can supply it **field
-by field** (`addr=0, count=2`) instead of assembling `b"\x00\x02"` by hand. The two forms
-are mutually exclusive — see
-[11.5](#115-supplying-the-payload-field-by-field-or-as-bytes).
+The payload can be supplied in three ways — **per `Pdu.fields`**, **inline with
+`Data`/`pack`**, or as **raw bytes** — see
+[11.5](#115-supplying-the-payload-three-ways).
 
 A missing field is never silently ignored — `FrameBuildError` names it and lists every
 field this frame accepts:
@@ -663,47 +662,91 @@ frame = proto.verify(wire)      # parse with the receive rules: exactly one fram
 proto.diff()                    # differences between the tx and rx specs (when they differ)
 ```
 
-### 11.5 Supplying the payload: field by field or as bytes
+### 11.5 Supplying the payload: three ways
 
-The two differ only in the **payload** segment; every other field (command code, `type`,
-`seq`, device id …) is identical:
+Pick by whether this data has a declared structure:
 
-```python
-proto = Protocol(AURORA_WITH_PDU, device_id=b"\x00\x00\x00\x07")   # the spec with pdus
-
-# payload field by field, as declared in Pdu.fields (addr, count are Pdu fields here)
-proto.build("Read", type=1, seq=1, addr=0x00, count=2)
-
-# whole payload at once, no Pdu.fields packing (good for variable/unstructured data)
-proto.build_raw("Read", b"\x00\x02", type=1, seq=1)
-```
-
-Both produce exactly the same bytes:
-
-```
-aa 0c 01 03 00 01 00 00 00 07 00 02 41 5c
-```
-
-**`b"\x00\x02"` is not the only way.** There are two routes, and which one applies
-depends on whether you declared `Pdu.fields`:
-
-| `Pdu.fields` declared? | How to supply the payload | Form |
+| Way | Form | Good for |
 |---|---|---|
-| yes (`0x03: Pdu("Read", [Field.u8("addr"), Field.u8("count")])`) | **field by field**, one keyword each | `build("Read", addr=0, count=2)` |
-| no | **one byte string**, or straight into the payload field | `build_raw(0x03, b"...")` ≡ `build(0x03, data=b"...")` |
+| ① per `Pdu.fields` | `build("Read", addr=0, count=2)` | fixed request layout, fields have names and types |
+| ② `Data` + `pack` inline | `build_raw(0x03, [Data.u8(0), Data.bool(True), Data.str("test", count=24)])` | one-off layouts not worth a `Pdu` |
+| ③ hand-written bytes | `build_raw(0x03, b"\x00\x02")` | the payload already is raw bytes |
 
-So `build_raw(target, payload)` is sugar for `build(target, data=payload)` — whatever the
-payload field is called, that is the keyword. Both give identical bytes:
+**① field by field** — declare the `Pdu` first (section 11.2), one keyword per field.
 
 ```python
-# with no pdus declared, these two are equivalent
-proto.build_raw(0x03, b"\x10\x20", type=1, seq=1)
-proto.build(0x03, data=b"\x10\x20", type=1, seq=1)
-# -> aa 0c 01 03 00 01 00 00 00 07 10 20 98 d1
+proto.build("Read", type=1, seq=1, addr=0x00, count=2)
 ```
 
-**The two routes are mutually exclusive.** Picking the wrong one fails immediately, and the
-error lists the fields that the current mode does accept:
+**② `Data` + `pack`** — no `Pdu` needed; list the values and let the library encode them.
+
+```python
+from kkprotocol import Data, pack
+
+body = pack(
+    Data.u8(0x00),                              # 1 byte
+    Data.u8(0x00),                              # 1 byte
+    Data.bool(True),                            # 0x01
+    Data.str("test", count=24, fill=b"\x00"),    # fixed 24, padded with \0
+)
+proto.build_raw(0x03, body, type=1, seq=1)
+
+# a list can be passed as the payload directly, no pack() call needed
+proto.build_raw(0x03, [Data.u8(0), Data.u8(0), Data.bool(True), Data.str("test", count=24)], type=1, seq=1)
+```
+
+`Data.xxx(value)` returns an encoded value; `pack()` concatenates them into `bytes`.
+The available constructors:
+
+| Call | Bytes | Result |
+|---|---|---|
+| `Data.u8(0x12)` | 1 | `12` |
+| `Data.u16(0x1234)` | 2 | `12 34` |
+| `Data.u16(0x1234, little_endian=True)` | 2 | `34 12` |
+| `Data.u32(...)` / `Data.u64(...)` | 4 / 8 | big-endian |
+| `Data.i8(-1)` / `Data.i16` / `Data.i32` / `Data.i64` | 1/2/4/8 | signed |
+| `Data.f32(1.5)` / `Data.f64(1.5)` | 4 / 8 | IEEE754, `3f c0 00 00` |
+| `Data.bool(True)` | 1 | `01` |
+| `Data.str("test", count=8)` | 8 | `74 65 73 74 00 00 00 00`, truncated if longer |
+| `Data.char(...)` | — | alias of `Data.str` |
+| `Data.raw(b"\x01\x02")` | 2 | bytes as-is |
+| `Data.zeros(3)` | 3 | `00 00 00` |
+
+> **Why are `Field` and `Data` two separate classes?** Their first argument means
+> different things: `Field.u8("cmd")` takes a **field name** — declare once, then read
+> values back by that name in both directions; `Data.u8(0x12)` takes a **value** and is
+> thrown away once encoded. Merging them would make `Field.u8(0)` ambiguous (is `0` a
+> field name or a value?), so they stay separate: **`Field` describes structure, `Data`
+> fills in values, `pack` joins them.**
+
+**③ hand-written bytes**:
+
+```python
+proto.build_raw(0x03, b"\x00\x02", type=1, seq=1)
+```
+
+All three produce **byte-identical** frames — ③ assembles bytes by hand, ② is just its
+typed spelling (`Data.u8(1)` *is* `b"\x01"`, minus the byte-order arithmetic), and ① is
+done for you by `Pdu.fields`:
+
+```python
+proto.build("Write", type=1, seq=1, a=0x01, b=0x0203)      # ① per field
+proto.build_raw(0x03, [Data.u8(0x01), Data.u16(0x0203)], ...)    # ② Data list
+proto.build_raw(0x03, b"\x01\x02\x03", ...)                # ③ raw bytes
+```
+
+All three build the very same frame:
+
+```
+aa 0d 01 03 00 01 00 00 00 07 01 02 03 3b ad
+```
+
+`build_raw(target, payload)` is also equivalent to `build(target, data=payload)` —
+whatever the payload field is called, that is the keyword; the bytes come out the same.
+
+**① and ②③ are mutually exclusive**: once `pdus` is declared you cannot hand over the
+whole segment, and vice versa. Using the wrong one fails immediately, and the error lists
+the fields that mode accepts:
 
 | Case | Error |
 |---|---|
@@ -855,6 +898,11 @@ Field(key=..., length=..., fmt=..., fixed=..., group=..., crc=..., desc=...)
 #   length: int | "10" | "{len.val}-8" | callable(fields) | None (to end of frame)
 #   fmt:    ""(bytes) | "B" | "!H" | "<H" | "!I" | "!Q" | "!f" | "4s" ...
 #   group:  "{n}{cmd}{body}"  (field names only, no attributes)
+
+# Shared: payload value constructors (value in, bytes out, no field name; see 11.5)
+Data.u8 / i8 / u16 / i16 / u32 / i32 / u64 / i64 / f32 / f64
+Data.bool(v) / Data.str(s, count=, fill=) / Data.char(...) / Data.raw(b) / Data.zeros(n)
+pack(*items) -> bytes        # also accepts a single list; build_raw takes them directly
 
 # Shared: exceptions
 FrameRuleError     # bad rule, should surface at startup

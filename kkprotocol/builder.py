@@ -49,9 +49,23 @@ from .errors import FrameBuildError, FrameInvalid, FrameRuleError
 from .frame import FieldValue, Frame
 from .framing import DelimiterFraming, wrap_frame
 from .length import LengthExpr
+from .pack import pack
 from .spec import ChecksumRule, FrameSpec, Pdu
 
 __all__ = ["BuildResult", "FrameBuilder", "Protocol"]
+
+
+def _coerce_payload(payload: Any) -> Any:
+    """把 ``build_raw`` 的载荷归一成「可直接放进字段的值」。
+
+    接受 ``bytes`` / ``str`` 原样；``Data.xxx(...)`` 之类按 ``bytes()`` 转；
+    列表/元组视为一组载荷项，按顺序拼接（等价于先调 :func:`kkprotocol.pack`）。
+    """
+    if isinstance(payload, (bytes, bytearray, str)):
+        return payload
+    if isinstance(payload, (list, tuple)):
+        return pack(*payload)
+    return bytes(payload)
 
 
 @dataclass(frozen=True)
@@ -204,20 +218,23 @@ class FrameBuilder:
         return self._build_frame(*self._select(target), values=values)
 
     def build_raw(
-        self, target: Any, payload: Union[bytes, bytearray, str] = b"", /, **values: Any
+        self, target: Any, payload: Any = b"", /, **values: Any
     ) -> bytes:
         """整段载荷模式：不查 Pdu 的字段表，把 ``payload`` 原样放进载荷字段。
 
         与 :meth:`build` 的区别只在载荷怎么来：``build`` 按 ``Pdu.fields`` 逐个
         打包，``build_raw`` 直接把一段字节塞进去（长度仍由长度字段自动回填）。
         其余帧壳字段（seq/devid 等）照旧用关键字参数给。
+
+        ``payload`` 可以是 ``bytes``、``Data.xxx(...)`` 的结果，或由它们组成的
+        列表/元组（等价于先调用 :func:`kkprotocol.pack`)。
         """
         key = self.spec.payload
         if key is None:
             raise FrameBuildError("这帧没有载荷字段（FrameSpec.payload），不需要给载荷")
         _, cmd_value = self._select(target)
         merged = dict(values)
-        merged[key] = payload
+        merged[key] = _coerce_payload(payload)
         return self._build_frame(None, cmd_value, merged).data
 
     def _build_frame(
@@ -878,9 +895,13 @@ class Protocol:
         return self.builder.build_frame(target, **values)
 
     def build_raw(
-        self, target: Any, payload: Union[bytes, bytearray, str] = b"", /, **values: Any
+        self, target: Any, payload: Any = b"", /, **values: Any
     ) -> bytes:
-        """整段载荷模式：载荷不再按 ``Pdu.fields`` 打包，直接塞一段字节。"""
+        """整段载荷模式：载荷不再按 ``Pdu.fields`` 打包，直接塞一段字节。
+
+        ``payload`` 可以是 ``bytes``、``Data.xxx(...)``，或它们的列表
+        （见 :func:`kkprotocol.pack`）。
+        """
         return self.builder.build_raw(target, payload, **values)
 
     def build_ack(self, req: Union[Frame, Pdu, int, str], /, **values: Any) -> bytes:

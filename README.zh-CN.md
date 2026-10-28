@@ -247,8 +247,8 @@ proto.verify(wire)
 
 记一条就够：**只有「算不出来、又不是常量」的字段才需要传**。
 
-载荷那段还有另一种给法：声明 `pdus` 之后可以**按字段逐个填**（`addr=0, count=2`），
-不必自己拼 `b"\x00\x02"`——两种给法互斥，见 [11.5](#115-载荷怎么给逐字段还是整段)。
+载荷那段有三种给法：**按 `Pdu.fields` 逐字段**、**用 `Data`/`pack` 内联构造**、
+**直接给裸字节**——见 [11.5](#115-载荷怎么给三种方式)。
 
 漏传不会被忽略——`FrameBuildError` 会明确告诉你缺哪个，并把**这帧能传的字段全列出来**：
 
@@ -634,44 +634,87 @@ frame = proto.verify(wire)      # 用收帧规则回环解析，必须一帧一�
 proto.diff()                    # 收发两份 spec 的差异（tx/rx 不同时）
 ```
 
-### 11.5 载荷怎么给：逐字段还是整段
+### 11.5 载荷怎么给：三种方式
 
-两个方法只有**载荷**那一段不同，其余字段（命令码、`type`、`seq`、设备号…）完全一样：
+按「这段数据有没有被声明过结构」来选：
 
-```python
-proto = Protocol(AURORA_WITH_PDU, device_id=b"\x00\x00\x00\x07")   # 带 pdus 的那份
-
-# 载荷按 Pdu.fields 逐字段给（addr、count 是 Pdu 里声明的字段）
-proto.build("Read", type=1, seq=1, addr=0x00, count=2)
-
-# 载荷整段给，不按 Pdu.fields 打包（适合变长/不定结构的数据）
-proto.build_raw("Read", b"\x00\x02", type=1, seq=1)
-```
-
-两者产出的字节完全相同：
-
-```
-aa 0c 01 03 00 01 00 00 00 07 00 02 41 5c
-```
-
-**关键在于：`b"\x00\x02"` 不是唯一给法。** 载荷有两条路，取决于有没有声明 `Pdu.fields`：
-
-| 声明了 `Pdu.fields`？ | 怎么给载荷 | 写法 |
+| 方式 | 写法 | 适用 |
 |---|---|---|
-| 有（`0x03: Pdu("Read", [Field.u8("addr"), Field.u8("count")])`） | **逐字段**，一个关键字一个字段 | `build("Read", addr=0, count=2)` |
-| 没有 | **整段字节**，或者直接塞给 payload 字段 | `build_raw(0x03, b"...")` ≡ `build(0x03, data=b"...")` |
+| ① 按 `Pdu.fields` 逐字段 | `build("Read", addr=0, count=2)` | 报文结构固定，字段有名有类型 |
+| ② `Data` + `pack` 内联构造 | `build_raw(0x03, [Data.u8(0), Data.bool(True), Data.str("test", count=24)])` | 一次性/临时结构，不值得为它写 `Pdu` |
+| ③ 手写整段 bytes | `build_raw(0x03, b"\x00\x02")` | 载荷本身就是裸字节，或从别处拿到 |
 
-所以 `build_raw(target, payload)` 其实就是 `build(target, data=payload)` 的语法糖——payload
-字段名叫什么，就用什么当关键字。实测两者字节完全一致：
+**① 逐字段**：先声明 `Pdu`（见 11.2），一个关键字一个字段。
 
 ```python
-# 没有 pdus 时，这两种写法等价
-proto.build_raw(0x03, b"\x10\x20", type=1, seq=1)
-proto.build(0x03, data=b"\x10\x20", type=1, seq=1)      # 等价
-# -> aa 0c 01 03 00 01 00 00 00 07 10 20 98 d1
+proto.build("Read", type=1, seq=1, addr=0x00, count=2)
 ```
 
-**两条路互斥**，用错了立刻报错，且报错会告诉你当前模式下能传哪些字段：
+**② `Data` + `pack`**：不用声明 Pdu，直接把值列出来，库负责编码。
+
+```python
+from kkprotocol import Data, pack
+
+body = pack(
+    Data.u8(0x00),                              # 1 字节
+    Data.u8(0x00),                              # 1 字节
+    Data.bool(True),                            # 0x01
+    Data.str("test", count=24, fill=b"\x00"),   # 定长 24，不足补 \0
+)
+proto.build_raw(0x03, body, type=1, seq=1)
+
+# 列表可以直接当载荷传，不必先 pack
+proto.build_raw(0x03, [Data.u8(0), Data.u8(0), Data.bool(True), Data.str("test", count=24)], type=1, seq=1)
+```
+
+`Data.xxx(值)` 返回「已编码的值」，`pack()` 按顺序拼成 `bytes`。可用的构造器：
+
+| 调用 | 字节数 | 结果 |
+|---|---|---|
+| `Data.u8(0x12)` | 1 | `12` |
+| `Data.u16(0x1234)` | 2 | `12 34` |
+| `Data.u16(0x1234, little_endian=True)` | 2 | `34 12` |
+| `Data.u32(...)` / `Data.u64(...)` | 4 / 8 | 大端 |
+| `Data.i8(-1)` / `Data.i16` / `Data.i32` / `Data.i64` | 1/2/4/8 | 有符号 |
+| `Data.f32(1.5)` / `Data.f64(1.5)` | 4 / 8 | IEEE754，`3f c0 00 00` |
+| `Data.bool(True)` | 1 | `01` |
+| `Data.str("test", count=8)` | 8 | `74 65 73 74 00 00 00 00`，超长截断 |
+| `Data.char(...)` | — | `Data.str` 的别名 |
+| `Data.raw(b"\x01\x02")` | 2 | 原样字节 |
+| `Data.zeros(3)` | 3 | `00 00 00` |
+
+> **为什么 `Field` 和 `Data` 是两个类？** 两者签名的第一个参数含义不同：
+> `Field.u8("cmd")` 给的是**字段名**，声明一次、收发两边都靠它取值；
+> `Data.u8(0x12)` 给的是**值**，编完就丢。
+> 合并成一个类会让 `Field.u8(0)` 产生歧义（字段名叫 0 还是值等于 0？），
+> 所以刻意分开：**`Field` 描述结构，`Data` 填值，`pack` 把它们拼起来。**
+
+**③ 手写 bytes**：
+
+```python
+proto.build_raw(0x03, b"\x00\x02", type=1, seq=1)
+```
+
+三种方式产出的帧**逐字节相同**——③ 是手工拼字节，② 只是它的类型化写法（`Data.u8(1)` 就是
+`b"\x01"`，但字节序不用你自己算），① 由 `Pdu.fields` 代劳：
+
+```python
+proto.build("Write", type=1, seq=1, a=0x01, b=0x0203)      # ① 逐字段
+proto.build_raw(0x03, [Data.u8(0x01), Data.u16(0x0203)], ...)    # ② Data 列表
+proto.build_raw(0x03, b"\x01\x02\x03", ...)                # ③ 裸字节
+```
+
+三者组出来的是同一帧：
+
+```
+aa 0d 01 03 00 01 00 00 00 07 01 02 03 3b ad
+```
+
+`build_raw(target, payload)` 也等价于 `build(target, data=payload)`——payload 字段叫什么名，
+就用什么当关键字，两种调用出来的字节一样。
+
+**① 与 ②③ 互斥**：声明了 `pdus` 就不能再整段给，反之亦然。用错了立刻报错，而且报错会
+列出当前模式下能传哪些字段：
 
 | 情况 | 报错 |
 |---|---|
@@ -804,6 +847,11 @@ Field(key=..., length=..., fmt=..., fixed=..., group=..., crc=..., desc=...)
 #   length: int | "10" | "{len.val}-8" | callable(fields) | None(取到帧尾)
 #   fmt:    ""(bytes) | "B" | "!H" | "<H" | "!I" | "!Q" | "!f" | "4s" ...
 #   group:  "{n}{cmd}{body}"（只写 {字段}，不带属性）
+
+# 共用：载荷值构造（给值、要字节，不需要字段名；见 11.5）
+Data.u8 / i8 / u16 / i16 / u32 / i32 / u64 / i64 / f32 / f64
+Data.bool(v) / Data.str(s, count=, fill=) / Data.char(...) / Data.raw(b) / Data.zeros(n)
+pack(*items) -> bytes        # 也接受单个列表；build_raw 的载荷可直接传这些
 
 # 共用：异常
 FrameRuleError     # 规则写错，启动期就该暴露
