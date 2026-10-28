@@ -215,7 +215,9 @@ AURORA = FrameSpec(
 
 proto = Protocol(AURORA, device_id=b"\x00\x00\x00\x07")
 
-# 发：长度、校验、设备号都是算出来回填的
+#         ┌─ 第 1 个参数：目标指令，写进命令码字段 cmd
+#         │        ┌─ 第 2 个参数：整段载荷，塞进 payload="data" 声明的 data 字段
+#         │        │            ┌─ 其余字段按字段名传：type / seq 在声明里没有来源
 wire = proto.build_raw(0x03, b"\x10\x20", type=0x01, seq=1)
 print(wire.hex(" "))
 # aa 0c 01 03 00 01 00 00 00 07 10 20 98 d1
@@ -228,6 +230,30 @@ print(frame.value("cmd"), frame.value("seq"), frame.value("data"))
 # 自检：发出的字节必须能被自己的收帧规则完整解回来
 proto.verify(wire)
 ```
+
+**为什么只传 `type` 和 `seq`？** 把 `AURORA` 的 8 个字段逐一对照——每个字段的值只有
+一个来源，凡是能推出来的都不用你管：
+
+| 字段 | 值从哪来 | 要传吗 |
+|---|---|---|
+| `header` | `fixed=0xAA`，常量 | 不用，自动填 |
+| `len` | `LengthRule("len")` 算出来回填 | **传了报错** |
+| `type` | 没有来源 | ✅ `type=0x01` |
+| `cmd` | 第 1 个位置参数 | ✅ 就是那个 `0x03` |
+| `seq` | 没有来源（声明 `AutoField` 后自动） | ✅ `seq=1` |
+| `dev` | `device="dev"` + `Protocol(device_id=...)` | 不用，可用 `dev=` 覆盖 |
+| `data` | 第 2 个位置参数 | ✅ 就是那个 `b"\x10\x20"` |
+| `crc` | `ChecksumRule("crc", ...)` 算出来回填 | **传了报错** |
+
+记一条就够：**只有「算不出来、又不是常量」的字段才需要传**。
+
+漏传不会被忽略——`FrameBuildError` 会明确告诉你缺哪个，并把**这帧能传的字段全列出来**：
+
+```
+缺少参数 ['type']；这帧可用: ['header', 'type', 'cmd', 'seq', 'dev', 'data']
+```
+
+忘了该传什么时，故意少传一个看报错清单，比翻文档快。
 
 把 `wire` 换成任意切分的块逐次 `feed`，结果都一样——这就是「黏包 / 半包自动处理」。
 
@@ -600,10 +626,49 @@ TIME_AND_SEQ = FrameSpec(
 
 ```python
 proto = Protocol(AURORA, device_id=b"\x00\x00\x00\x07")
-wire = proto.build_raw(None, b"\x10\x20", type=1, cmd=3, seq=1)
+wire = proto.build_raw(0x03, b"\x10\x20", type=1, seq=1)
 frame = proto.verify(wire)      # 用收帧规则回环解析，必须一帧一字节不剩
 proto.diff()                    # 收发两份 spec 的差异（tx/rx 不同时）
 ```
+
+### 11.5 `build` 与 `build_raw`：载荷怎么给
+
+两个方法只有**载荷**那一段不同，其余字段（命令码、`type`、`seq`、设备号…）完全一样：
+
+```python
+proto = Protocol(AURORA_WITH_PDU, device_id=b"\x00\x00\x00\x07")   # 带 pdus 的那份
+
+# 载荷按 Pdu.fields 逐字段给（addr、count 是 Pdu 里声明的字段）
+proto.build("Read", type=1, seq=1, addr=0x00, count=2)
+
+# 载荷整段给，不按 Pdu.fields 打包（适合变长/不定结构的数据）
+proto.build_raw("Read", b"\x00\x02", type=1, seq=1)
+```
+
+两者产出的字节完全相同：
+
+```
+aa 0c 01 03 00 01 00 00 00 07 00 02 41 5c
+```
+
+- `build(target, **fields)`：载荷字段来自 `Pdu.fields`，一个字段一个关键字；
+- `build_raw(target, payload, **shell)`：第一个位置参数是目标指令，第二个是整段载荷字节
+  （直接写进 `payload=` 声明的字段）；
+- 目标 `target` 可以是命令码 `0x03`、指令名 `"Read"`，或 `Pdu` 对象——三者等价；
+- 没声明 `pdus` 时可以直接传命令码：`proto.build_raw(0x03, b"...", ...)`。
+
+三个容易踩的点：
+
+| 现象 | 原因 | 怎么办 |
+|---|---|---|
+| `缺少参数 ['type']` | 该字段在声明里没有来源 | 按字段名补上，报错里会列出全部可用字段 |
+| `字段 'len' 由 builder 自动计算` | 长度/校验字段不接受手动值 | 删掉 `len=` / `crc=`，让它自己算 |
+| 传了 `header=0xBB` 却还是 `AA` | `fixed=` 字段以声明为准，手动值被**静默忽略** | 改声明里的 `fixed=`，别在调用处传 |
+
+最后一个尤其隐蔽：它不报错也不生效。想改固定的帧头/版本号，改 `Field.u8(..., fixed=...)`。
+
+> `AutoField` 声明的字段（如自增 `seq`）**可以**手动传：本次就用你给的值，之后计数器
+> 从该值往后继续。`seq=5` 之后下一帧自然是 `6`。
 
 ---
 
@@ -689,6 +754,9 @@ print(dlt645.decode_data(frame.value("data")))   # b'\x10\x01'
 13. **`ChecksumRule.impl` 每次返回不同结果**：不动点循环无法收敛，报「来回震荡」。
 14. **收发复用一份 spec 却格式不同**：发得出、收不回。写两份交给 `Protocol(tx=..., rx=...)`。
 15. **载荷长度表达式偏移写错**：组帧末尾的一致性核对会拦下来，提示「对面按同一规则解析会错位」。
+16. **在调用处给 `fixed=` 字段传值**（如 `build(..., header=0xBB)`）：不报错也不生效，
+    值以声明为准——要改就改 `Field.u8("header", fixed=...)`。
+17. **以为 `AutoField` 字段不能手动给**：可以，传了就是覆盖本次值，计数器从该值往后走。
 
 ---
 

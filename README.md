@@ -223,7 +223,9 @@ AURORA = FrameSpec(
 
 proto = Protocol(AURORA, device_id=b"\x00\x00\x00\x07")
 
-# Build: length, checksum and device id are all computed and backfilled
+#        ┌─ 1st argument: target command, written into the cmd field
+#        │        ┌─ 2nd argument: whole payload, goes into the field named by payload="data"
+#        │        │            ┌─ everything else by field name: type / seq have no source
 wire = proto.build_raw(0x03, b"\x10\x20", type=0x01, seq=1)
 print(wire.hex(" "))
 # aa 0c 01 03 00 01 00 00 00 07 10 20 98 d1
@@ -236,6 +238,33 @@ print(frame.value("cmd"), frame.value("seq"), frame.value("data"))
 # Self-check: the bytes we emit must parse back with our own receive rules
 proto.verify(wire)
 ```
+
+**Why only `type` and `seq`?** Walk the 8 fields of `AURORA` — each value has exactly one
+source, and anything derivable is not your business:
+
+| Field | Where its value comes from | Pass it? |
+|---|---|---|
+| `header` | `fixed=0xAA`, a constant | no, filled in automatically |
+| `len` | computed by `LengthRule("len")` and backfilled | **passing it raises** |
+| `type` | no source | ✅ `type=0x01` |
+| `cmd` | 1st positional argument | ✅ that `0x03` |
+| `seq` | no source (automatic once declared as `AutoField`) | ✅ `seq=1` |
+| `dev` | `device="dev"` + `Protocol(device_id=...)` | no, `dev=` may override |
+| `data` | 2nd positional argument | ✅ that `b"\x10\x20"` |
+| `crc` | computed by `ChecksumRule("crc", ...)` and backfilled | **passing it raises** |
+
+One rule covers all of it: **pass a field only when it can neither be derived nor is a
+constant.**
+
+A missing field is never silently ignored — `FrameBuildError` names it and lists every
+field this frame accepts:
+
+```
+缺少参数 ['type']；这帧可用: ['header', 'type', 'cmd', 'seq', 'dev', 'data']
+```
+
+(Error messages are currently Chinese-only.) When unsure what to pass, omit something on
+purpose and read the list — faster than re-reading docs.
 
 Feed `wire` in blocks split at arbitrary positions and the result is identical — that is
 "sticky / partial packets handled".
@@ -624,10 +653,53 @@ TIME_AND_SEQ = FrameSpec(
 
 ```python
 proto = Protocol(AURORA, device_id=b"\x00\x00\x00\x07")
-wire = proto.build_raw(None, b"\x10\x20", type=1, cmd=3, seq=1)
+wire = proto.build_raw(0x03, b"\x10\x20", type=1, seq=1)
 frame = proto.verify(wire)      # parse with the receive rules: exactly one frame, no leftovers
 proto.diff()                    # differences between the tx and rx specs (when they differ)
 ```
+
+### 11.5 `build` vs `build_raw`: how the payload is supplied
+
+The two differ only in the **payload** segment; every other field (command code, `type`,
+`seq`, device id …) is identical:
+
+```python
+proto = Protocol(AURORA_WITH_PDU, device_id=b"\x00\x00\x00\x07")   # the spec with pdus
+
+# payload field by field, as declared in Pdu.fields (addr, count are Pdu fields here)
+proto.build("Read", type=1, seq=1, addr=0x00, count=2)
+
+# whole payload at once, no Pdu.fields packing (good for variable/unstructured data)
+proto.build_raw("Read", b"\x00\x02", type=1, seq=1)
+```
+
+Both produce exactly the same bytes:
+
+```
+aa 0c 01 03 00 01 00 00 00 07 00 02 41 5c
+```
+
+- `build(target, **fields)`: payload fields come from `Pdu.fields`, one keyword each;
+- `build_raw(target, payload, **shell)`: 1st positional is the target command, 2nd is the
+  whole payload in bytes (written straight into the field named by `payload=`);
+- `target` may be a command code `0x03`, a command name `"Read"`, or a `Pdu` — all equivalent;
+- with no `pdus` declared, pass the command code directly:
+  `proto.build_raw(0x03, b"...", ...)`.
+
+Three things that bite:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `缺少参数 ['type']` | that field has no source in the declaration | pass it by name; the error lists every accepted field |
+| `字段 'len' 由 builder 自动计算` | length/checksum fields reject manual values | drop `len=` / `crc=`, they are computed |
+| `header=0xBB` is passed but the frame still says `AA` | `fixed=` fields trust the declaration; manual values are **silently ignored** | change `fixed=` in the declaration instead |
+
+The last one is the sneaky one: no error, no effect. To change a fixed header or version
+byte, edit `Field.u8(..., fixed=...)`.
+
+> Fields declared as `AutoField` (an incrementing `seq`, say) **can** be passed manually:
+> this frame uses your value, and the counter continues from it afterwards. `seq=5` means
+> the next frame gets `6`.
 
 ---
 
@@ -727,6 +799,10 @@ print(dlt645.decode_data(frame.value("data")))   # b'\x10\x01'
     specs and pass `Protocol(tx=..., rx=...)`.
 15. **A wrong offset in the payload length expression**: the end-of-build consistency
     check catches it and warns that the peer will misalign under the same rule.
+16. **Passing a value for a `fixed=` field at the call site** (e.g. `build(..., header=0xBB)`):
+    no error and no effect — the declaration wins. Edit `Field.u8("header", fixed=...)`.
+17. **Assuming `AutoField` fields cannot be given manually**: they can. The value you pass
+    is used for this frame and the counter continues from it.
 
 ---
 
