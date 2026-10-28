@@ -247,6 +247,9 @@ proto.verify(wire)
 
 记一条就够：**只有「算不出来、又不是常量」的字段才需要传**。
 
+载荷那段还有另一种给法：声明 `pdus` 之后可以**按字段逐个填**（`addr=0, count=2`），
+不必自己拼 `b"\x00\x02"`——两种给法互斥，见 [11.5](#115-载荷怎么给逐字段还是整段)。
+
 漏传不会被忽略——`FrameBuildError` 会明确告诉你缺哪个，并把**这帧能传的字段全列出来**：
 
 ```
@@ -631,7 +634,7 @@ frame = proto.verify(wire)      # 用收帧规则回环解析，必须一帧一�
 proto.diff()                    # 收发两份 spec 的差异（tx/rx 不同时）
 ```
 
-### 11.5 `build` 与 `build_raw`：载荷怎么给
+### 11.5 载荷怎么给：逐字段还是整段
 
 两个方法只有**载荷**那一段不同，其余字段（命令码、`type`、`seq`、设备号…）完全一样：
 
@@ -651,11 +654,41 @@ proto.build_raw("Read", b"\x00\x02", type=1, seq=1)
 aa 0c 01 03 00 01 00 00 00 07 00 02 41 5c
 ```
 
-- `build(target, **fields)`：载荷字段来自 `Pdu.fields`，一个字段一个关键字；
-- `build_raw(target, payload, **shell)`：第一个位置参数是目标指令，第二个是整段载荷字节
-  （直接写进 `payload=` 声明的字段）；
+**关键在于：`b"\x00\x02"` 不是唯一给法。** 载荷有两条路，取决于有没有声明 `Pdu.fields`：
+
+| 声明了 `Pdu.fields`？ | 怎么给载荷 | 写法 |
+|---|---|---|
+| 有（`0x03: Pdu("Read", [Field.u8("addr"), Field.u8("count")])`） | **逐字段**，一个关键字一个字段 | `build("Read", addr=0, count=2)` |
+| 没有 | **整段字节**，或者直接塞给 payload 字段 | `build_raw(0x03, b"...")` ≡ `build(0x03, data=b"...")` |
+
+所以 `build_raw(target, payload)` 其实就是 `build(target, data=payload)` 的语法糖——payload
+字段名叫什么，就用什么当关键字。实测两者字节完全一致：
+
+```python
+# 没有 pdus 时，这两种写法等价
+proto.build_raw(0x03, b"\x10\x20", type=1, seq=1)
+proto.build(0x03, data=b"\x10\x20", type=1, seq=1)      # 等价
+# -> aa 0c 01 03 00 01 00 00 00 07 10 20 98 d1
+```
+
+**两条路互斥**，用错了立刻报错，且报错会告诉你当前模式下能传哪些字段：
+
+| 情况 | 报错 |
+|---|---|
+| 有 pdus 还想整段给 `data=` | `不认识的参数 ['data']；这帧可用: ['header','type','cmd','seq','dev','addr','count']` |
+| 用 `build_raw` 还想逐字段给 `addr=` | `不认识的参数 ['addr']；这帧可用: ['header','type','cmd','seq','dev','data']` |
+
+所以判断「这帧该传什么」最简单的办法还是看那句「这帧可用」。
+
+> 载荷字段**不传就是空载荷**，不报错：`build(0x03, type=1, seq=1)` 组出 `aa 0a ...`
+> （`len=10`，data 部分 0 字节）。有些协议的空帧正是这样，所以这里不做强制校验。
+
+另外三点：
+
 - 目标 `target` 可以是命令码 `0x03`、指令名 `"Read"`，或 `Pdu` 对象——三者等价；
-- 没声明 `pdus` 时可以直接传命令码：`proto.build_raw(0x03, b"...", ...)`。
+- `Pdu.fields` 里的字段顺序就是线上顺序，不用在调用处关心偏移；
+- 逐字段给时，字段的 `fmt` 决定打包宽度（`Field.u16("value")` 自动按 `!H` 打包），
+  比手算 `b"\x00\xfa"` 可靠。
 
 三个容易踩的点：
 

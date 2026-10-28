@@ -256,6 +256,11 @@ source, and anything derivable is not your business:
 One rule covers all of it: **pass a field only when it can neither be derived nor is a
 constant.**
 
+The payload segment has a second form: once `pdus` is declared you can supply it **field
+by field** (`addr=0, count=2`) instead of assembling `b"\x00\x02"` by hand. The two forms
+are mutually exclusive — see
+[11.5](#115-supplying-the-payload-field-by-field-or-as-bytes).
+
 A missing field is never silently ignored — `FrameBuildError` names it and lists every
 field this frame accepts:
 
@@ -658,7 +663,7 @@ frame = proto.verify(wire)      # parse with the receive rules: exactly one fram
 proto.diff()                    # differences between the tx and rx specs (when they differ)
 ```
 
-### 11.5 `build` vs `build_raw`: how the payload is supplied
+### 11.5 Supplying the payload: field by field or as bytes
 
 The two differ only in the **payload** segment; every other field (command code, `type`,
 `seq`, device id …) is identical:
@@ -679,12 +684,44 @@ Both produce exactly the same bytes:
 aa 0c 01 03 00 01 00 00 00 07 00 02 41 5c
 ```
 
-- `build(target, **fields)`: payload fields come from `Pdu.fields`, one keyword each;
-- `build_raw(target, payload, **shell)`: 1st positional is the target command, 2nd is the
-  whole payload in bytes (written straight into the field named by `payload=`);
+**`b"\x00\x02"` is not the only way.** There are two routes, and which one applies
+depends on whether you declared `Pdu.fields`:
+
+| `Pdu.fields` declared? | How to supply the payload | Form |
+|---|---|---|
+| yes (`0x03: Pdu("Read", [Field.u8("addr"), Field.u8("count")])`) | **field by field**, one keyword each | `build("Read", addr=0, count=2)` |
+| no | **one byte string**, or straight into the payload field | `build_raw(0x03, b"...")` ≡ `build(0x03, data=b"...")` |
+
+So `build_raw(target, payload)` is sugar for `build(target, data=payload)` — whatever the
+payload field is called, that is the keyword. Both give identical bytes:
+
+```python
+# with no pdus declared, these two are equivalent
+proto.build_raw(0x03, b"\x10\x20", type=1, seq=1)
+proto.build(0x03, data=b"\x10\x20", type=1, seq=1)
+# -> aa 0c 01 03 00 01 00 00 00 07 10 20 98 d1
+```
+
+**The two routes are mutually exclusive.** Picking the wrong one fails immediately, and the
+error lists the fields that the current mode does accept:
+
+| Case | Error |
+|---|---|
+| pdus declared, still passing `data=` | `不认识的参数 ['data']；这帧可用: [... 'addr', 'count']` |
+| `build_raw` but passing `addr=` | `不认识的参数 ['addr']；这帧可用: [... 'data']` |
+
+Which is why "read the 这帧可用 list" remains the fastest way to learn a frame's signature.
+
+> Omitting the payload field means an **empty payload**, not an error:
+> `build(0x03, type=1, seq=1)` yields `aa 0a ...` (`len=10`, zero data bytes). Some
+> protocols have exactly such empty frames, so this is deliberately not enforced.
+
+Also:
+
 - `target` may be a command code `0x03`, a command name `"Read"`, or a `Pdu` — all equivalent;
-- with no `pdus` declared, pass the command code directly:
-  `proto.build_raw(0x03, b"...", ...)`.
+- field order in `Pdu.fields` is the on-wire order; you never compute offsets by hand;
+- going field by field, `fmt` decides the packing width (`Field.u16("value")` packs as
+  `!H`), which beats hand-writing `b"\x00\xfa"`.
 
 Three things that bite:
 
